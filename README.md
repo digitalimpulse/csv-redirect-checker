@@ -7,9 +7,9 @@ This Node.js script checks a CSV list of redirects for issues like redirect loop
 ## ✅ What It Does
 
 - 🧼 Cleans duplicate redirects
-- 🔁 Flags and removes redirect loops (e.g. `/ → /`)
+- 🔁 Flags and removes redirect loops (e.g. `/about → https://example.com/about`)
 - 🔗 Detects redirect chains (e.g. A → B → C)
-- 🌐 Optionally validates destination URLs (2s delay per URL)
+- 🌐 Optionally validates destination URLs
 - 📝 Exports:
   - `output/<filename>.csv` – cleaned list with issues removed (no headers)
   - `output/redirect-errors.csv` – any destination not returning HTTP 200
@@ -45,5 +45,3 @@ node redirect-checker.js
 ```
 
 You'll be prompted to enter the path to your CSV (e.g., `example.csv`).
-
----
