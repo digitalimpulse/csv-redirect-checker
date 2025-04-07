@@ -3,7 +3,9 @@
   "version": "1.0.0",
   "main": "redirect-checker.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start": "node redirect-checker.js",
+    "zip": "rm -rf redirect-checker.zip && zip -r redirect-checker.zip redirect-checker.js package.json README.md run.bat run.command example.csv"
   },
   "author": "",
   "license": "ISC",

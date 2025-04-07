@@ -38,10 +38,6 @@ Each line must have:
 
 ### 4. Run the Script
 
-In your terminal, run:
-
-```bash
-node redirect-checker.js
-```
+Open `run.bat` on Windows or `run.command` on Mac OS
 
 You'll be prompted to enter the path to your CSV (e.g., `example.csv`).
