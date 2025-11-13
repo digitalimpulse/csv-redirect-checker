@@ -14,6 +14,9 @@ const rl = readline.createInterface({
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
+// In-memory cache for URL status codes
+const urlCache = new Map();
+
 const checkStatusCode = (url) => {
     return new Promise((resolve) => {
         const mod = url.startsWith('https') ? https : http;
@@ -32,6 +35,20 @@ const checkStatusCode = (url) => {
             resolve({ url, status: 'invalid url' });
         }
     });
+};
+
+const checkStatusCodeWithCache = async (url) => {
+    if (urlCache.has(url)) {
+        const cachedResult = urlCache.get(url);
+        console.log(`💾 Cache hit: ${url} → ${cachedResult.status}`);
+        return cachedResult;
+    }
+
+    const result = await checkStatusCode(url);
+
+    urlCache.set(url, result);
+
+    return result;
 };
 
 const normalizePath = (url) => {
@@ -79,10 +96,12 @@ rl.question('Enter the path to the CSV file: ', (inputPath) => {
 
             // Detect redirect loops and filter them out
             const filteredRows = [];
+            const loopsAndChains = [];
             const sourceSet = new Set();
             uniqueRows.forEach(row => {
                 if (row._source === row._dest) {
                     issues.push(`⚠️ Redirect loop: ${row._source} → ${row._dest}`);
+                    loopsAndChains.push(row);
                 } else {
                     filteredRows.push(row);
                     sourceSet.add(row._source);
@@ -93,6 +112,7 @@ rl.question('Enter the path to the CSV file: ', (inputPath) => {
             filteredRows.forEach(row => {
                 if (sourceSet.has(row._dest)) {
                     issues.push(`⚠️ Potential chain redirect: ${row._source} → ${row._dest}`);
+                    loopsAndChains.push(row);
                 }
             });
 
@@ -128,25 +148,48 @@ rl.question('Enter the path to the CSV file: ', (inputPath) => {
                     return;
                 }
 
-                console.log('\n🌐 Validating URLs...');
+                console.log('\n🌐 Validating destination URLs for cleaned redirects...');
                 const errorLog = [];
 
+                // Test cleaned redirects
                 for (const row of cleanedOutput) {
                     const sourceURL = Object.values(row)[0];
                     const destURL = Object.values(row)[1];
 
                     if (!destURL.startsWith('http')) {
                         console.log(`⏩ Skipping invalid URL: ${destURL}`);
-                        errorLog.push({ source: sourceURL, destination: destURL, status: 'invalid url' });
+                        errorLog.push({ source: sourceURL, destination: destURL, status: 'invalid url', type: 'cleaned' });
                         continue;
                     }
 
                     await sleep(1000);
-                    const result = await checkStatusCode(destURL);
+                    const result = await checkStatusCodeWithCache(destURL);
                     console.log(`🔗 ${result.url} → ${result.status}`);
 
                     if (String(result.status) !== '200') {
-                        errorLog.push({ source: sourceURL, destination: destURL, status: result.status });
+                        errorLog.push({ source: sourceURL, destination: destURL, status: result.status, type: 'cleaned' });
+                    }
+                }
+
+                // Test destination URLs for rows with issues (loops and chains)
+                console.log('\n🌐 Validating destination URLs for problematic redirects...');
+
+                for (const row of loopsAndChains) {
+                    const sourceURL = Object.values(row)[0];
+                    const destURL = Object.values(row)[1];
+
+                    if (!destURL.startsWith('http')) {
+                        console.log(`⏩ Skipping invalid URL: ${destURL}`);
+                        errorLog.push({ source: sourceURL, destination: destURL, status: 'invalid url', type: 'problematic' });
+                        continue;
+                    }
+
+                    await sleep(1000);
+                    const result = await checkStatusCodeWithCache(destURL);
+                    console.log(`🔗 ${result.url} → ${result.status}`);
+
+                    if (String(result.status) !== '200') {
+                        errorLog.push({ source: sourceURL, destination: destURL, status: result.status, type: 'problematic' });
                     }
                 }
 
