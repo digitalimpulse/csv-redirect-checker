@@ -2,19 +2,152 @@ const fs = require('fs');
 const path = require('path');
 const readline = require('readline');
 const csv = require('csv-parser');
-const { parse } = require('url');
 const { stringify } = require('csv-stringify/sync');
 const https = require('https');
 const http = require('http');
 
-const rl = readline.createInterface({
-    input: process.stdin,
-    output: process.stdout
-});
+const ISSUE_TYPES = {
+    DUPLICATE_SAME_DEST: 'duplicate_same_dest',
+    DUPLICATE_DIFF_DEST: 'duplicate_diff_dest',
+    LOOP: 'loop',
+    CHAIN: 'chain',
+};
 
-const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+const OUTPUT_DIR = path.join(__dirname, 'output');
 
-const checkStatusCode = (url) => {
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function normalizePath(input) {
+    try {
+        const parsed = new URL(input, 'http://placeholder');
+        const normalized = (parsed.pathname || '/').replace(/\/$/, '').toLowerCase();
+        return normalized === '' ? '/' : normalized;
+    } catch {
+        return '/';
+    }
+}
+
+function prompt(rl, question) {
+    return new Promise((resolve) => rl.question(question, resolve));
+}
+
+function ensureOutputDir() {
+    if (!fs.existsSync(OUTPUT_DIR)) {
+        fs.mkdirSync(OUTPUT_DIR);
+    }
+}
+
+function writeCsv(filename, data, options = {}) {
+    const filePath = path.join(OUTPUT_DIR, filename);
+    const content = stringify(data, options);
+    fs.writeFileSync(filePath, content);
+    return filePath;
+}
+
+function parseCSV(filePath) {
+    return new Promise((resolve, reject) => {
+        const rows = [];
+        fs.createReadStream(filePath)
+            .pipe(csv({ headers: ['source', 'destination'], skipLines: 0 }))
+            .on('data', (row) => {
+                rows.push({
+                    source: row.source,
+                    destination: row.destination,
+                });
+            })
+            .on('end', () => resolve(rows))
+            .on('error', reject);
+    });
+}
+
+function analyzeRedirects(rows) {
+    const issues = [];
+    const seen = new Map();
+    const sourceMap = new Map();
+    const duplicateEntries = [];
+
+    const normalized = rows.map((row) => ({
+        source: row.source,
+        destination: row.destination,
+        normalizedSource: normalizePath(row.source),
+        normalizedDest: normalizePath(row.destination),
+    }));
+
+    const unique = [];
+    for (const entry of normalized) {
+        const pairKey = `${entry.normalizedSource}->${entry.normalizedDest}`;
+
+        if (!sourceMap.has(entry.normalizedSource)) {
+            sourceMap.set(entry.normalizedSource, []);
+        }
+        sourceMap.get(entry.normalizedSource).push(entry);
+
+        if (!seen.has(pairKey)) {
+            seen.set(pairKey, true);
+            unique.push(entry);
+        }
+    }
+
+    for (const [source, entries] of sourceMap) {
+        const uniqueDests = new Set(entries.map((e) => e.normalizedDest));
+        if (uniqueDests.size > 1) {
+            issues.push({
+                type: ISSUE_TYPES.DUPLICATE_DIFF_DEST,
+                source,
+                destinations: [...uniqueDests],
+                count: entries.length,
+            });
+            for (const e of entries) {
+                duplicateEntries.push({
+                    source: e.source,
+                    destination: e.destination,
+                    normalized_source: e.normalizedSource,
+                });
+            }
+        } else if (entries.length > 1) {
+            issues.push({
+                type: ISSUE_TYPES.DUPLICATE_SAME_DEST,
+                source,
+                destination: entries[0].normalizedDest,
+                count: entries.length,
+            });
+        }
+    }
+
+    const filtered = [];
+    const problematic = [];
+    const sourceSet = new Set();
+    for (const entry of unique) {
+        if (entry.normalizedSource === entry.normalizedDest) {
+            issues.push({
+                type: ISSUE_TYPES.LOOP,
+                source: entry.normalizedSource,
+                destination: entry.normalizedDest,
+            });
+            problematic.push(entry);
+        } else {
+            filtered.push(entry);
+            sourceSet.add(entry.normalizedSource);
+        }
+    }
+
+    for (const entry of filtered) {
+        if (sourceSet.has(entry.normalizedDest)) {
+            issues.push({
+                type: ISSUE_TYPES.CHAIN,
+                source: entry.normalizedSource,
+                destination: entry.normalizedDest,
+            });
+            problematic.push(entry);
+        }
+    }
+
+    return { issues, filtered, problematic, duplicateEntries };
+}
+
+const urlCache = new Map();
+
+function checkStatusCode(url) {
     return new Promise((resolve) => {
         const mod = url.startsWith('https') ? https : http;
         try {
@@ -22,144 +155,159 @@ const checkStatusCode = (url) => {
                 resolve({ url, status: res.statusCode });
                 res.resume();
             });
-
             req.on('error', () => resolve({ url, status: 'error' }));
             req.setTimeout(5000, () => {
                 req.abort();
                 resolve({ url, status: 'timeout' });
             });
-        } catch (e) {
+        } catch {
             resolve({ url, status: 'invalid url' });
         }
     });
-};
+}
 
-const normalizePath = (url) => {
-    const parsed = parse(url || '');
-    let path = (parsed.pathname || '/').replace(/\/$/, '').toLowerCase();
-    return path === '' ? '/' : path;
-};
+async function checkStatusCodeCached(url) {
+    if (urlCache.has(url)) {
+        return { ...urlCache.get(url), cached: true };
+    }
 
-rl.question('Enter the path to the CSV file: ', (inputPath) => {
-    const fullPath = path.resolve(inputPath);
-    if (!fs.existsSync(fullPath)) {
-        console.error('❌ File does not exist.');
-        rl.close();
+    await sleep(1000);
+    const result = await checkStatusCode(url);
+    urlCache.set(url, result);
+    return { ...result, cached: false };
+}
+
+async function validateURLs(rows, type) {
+    const errors = [];
+
+    for (const row of rows) {
+        if (!row.destination.startsWith('http')) {
+            console.log(`  [SKIP] ${row.destination} - not a valid URL`);
+            errors.push({ source: row.source, destination: row.destination, status: 'invalid url', type });
+            continue;
+        }
+
+        const result = await checkStatusCodeCached(row.destination);
+        const label = String(result.status) === '200' ? 'OK' : 'FAIL';
+        const suffix = result.cached ? ' (cached)' : '';
+        console.log(`  [${label}] ${result.url} -> ${result.status}${suffix}`);
+
+        if (String(result.status) !== '200') {
+            errors.push({ source: row.source, destination: row.destination, status: result.status, type });
+        }
+    }
+
+    return errors;
+}
+
+function formatIssue(issue) {
+    switch (issue.type) {
+        case ISSUE_TYPES.DUPLICATE_DIFF_DEST:
+            return `[DUPLICATE] "${issue.source}" has ${issue.destinations.length} different destinations: ${issue.destinations.join(', ')}`;
+        case ISSUE_TYPES.DUPLICATE_SAME_DEST:
+            return `[DUPLICATE] "${issue.source}" appears ${issue.count} times with the same destination`;
+        case ISSUE_TYPES.LOOP:
+            return `[LOOP] ${issue.source} -> ${issue.destination}`;
+        case ISSUE_TYPES.CHAIN:
+            return `[CHAIN] ${issue.source} -> ${issue.destination}`;
+        default:
+            return `[UNKNOWN] ${JSON.stringify(issue)}`;
+    }
+}
+
+function printSummary(issues) {
+    if (!issues.length) {
+        console.log('No issues found.');
         return;
     }
 
-    const rows = [];
-    fs.createReadStream(fullPath)
-        .pipe(csv({ headers: ['source', 'destination'], skipLines: 0 }))
-        .on('data', (data) => rows.push(data))
-        .on('end', async () => {
-            console.log('🔍 Checking for redirect issues...');
+    const grouped = {};
+    for (const issue of issues) {
+        if (!grouped[issue.type]) grouped[issue.type] = [];
+        grouped[issue.type].push(issue);
+    }
 
-            const issues = [];
-            const uniqueMap = new Map();
+    console.log('\n--- Issues Found ---\n');
 
-            // Normalize paths and remove duplicates
-            rows.forEach(row => {
-                const sourceKey = Object.keys(row)[0];
-                const destKey = Object.keys(row)[1];
-                const source = normalizePath(row[sourceKey]);
-                const dest = normalizePath(row[destKey]);
-                const pairKey = `${source}->${dest}`;
-                console.log(source, dest);
-                if (!uniqueMap.has(pairKey)) {
-                    uniqueMap.set(pairKey, {
-                        ...row,
-                        _source: source,
-                        _dest: dest
-                    });
-                }
-            });
+    const typeLabels = {
+        [ISSUE_TYPES.DUPLICATE_DIFF_DEST]: 'Duplicates (different destinations)',
+        [ISSUE_TYPES.DUPLICATE_SAME_DEST]: 'Duplicates (same destination)',
+        [ISSUE_TYPES.LOOP]: 'Redirect Loops',
+        [ISSUE_TYPES.CHAIN]: 'Redirect Chains',
+    };
 
-            const uniqueRows = Array.from(uniqueMap.values());
+    for (const [type, items] of Object.entries(grouped)) {
+        const label = typeLabels[type] || type;
+        console.log(`${label} (${items.length}):`);
+        for (const issue of items) {
+            console.log(`  ${formatIssue(issue)}`);
+        }
+        console.log('');
+    }
 
-            // Detect redirect loops and filter them out
-            const filteredRows = [];
-            const sourceSet = new Set();
-            uniqueRows.forEach(row => {
-                if (row._source === row._dest) {
-                    issues.push(`⚠️ Redirect loop: ${row._source} → ${row._dest}`);
-                } else {
-                    filteredRows.push(row);
-                    sourceSet.add(row._source);
-                }
-            });
+    console.log(`Total: ${issues.length} issue(s)`);
+}
 
-            // Detect redirect chains (after filtering)
-            filteredRows.forEach(row => {
-                if (sourceSet.has(row._dest)) {
-                    issues.push(`⚠️ Potential chain redirect: ${row._source} → ${row._dest}`);
-                }
-            });
+function writeResults({ filtered, duplicateEntries, errors }) {
+    ensureOutputDir();
 
-            // Clean for CSV output
-            const cleanedOutput = filteredRows.map(row => {
-                const cleanedRow = { ...row };
-                delete cleanedRow._source;
-                delete cleanedRow._dest;
-                return cleanedRow;
-            });
+    const cleanedRows = filtered.map((e) => ({ source: e.source, destination: e.destination }));
+    const cleanedPath = writeCsv('cleaned.csv', cleanedRows, { header: false });
+    console.log(`Cleaned CSV saved to: ${cleanedPath}`);
 
-            // Output CSV
-            const outputDir = path.join(__dirname, 'output');
-            if (!fs.existsSync(outputDir)) {
-                fs.mkdirSync(outputDir);
+    if (duplicateEntries.length) {
+        const dupPath = writeCsv('duplicates.csv', duplicateEntries, { header: true });
+        console.log(`${duplicateEntries.length} duplicate entries written to: ${dupPath}`);
+    }
+
+    if (errors && errors.length) {
+        const errPath = writeCsv('redirect-errors.csv', errors, { header: true });
+        console.log(`${errors.length} URL errors written to: ${errPath}`);
+    }
+}
+
+async function main() {
+    const rl = readline.createInterface({
+        input: process.stdin,
+        output: process.stdout,
+    });
+
+    try {
+        const inputPath = await prompt(rl, 'Enter the path to the CSV file: ');
+        const fullPath = path.resolve(inputPath);
+
+        if (!fs.existsSync(fullPath)) {
+            console.error('Error: File does not exist.');
+            return;
+        }
+
+        console.log('Checking for redirect issues...\n');
+        const rows = await parseCSV(fullPath);
+        const { issues, filtered, problematic, duplicateEntries } = analyzeRedirects(rows);
+
+        printSummary(issues);
+
+        let errors = null;
+        const answer = await prompt(rl, '\nWould you like to validate final destination URLs? (y/n): ');
+
+        if (answer.toLowerCase() === 'y') {
+            console.log('\nValidating cleaned redirects...\n');
+            const cleanedErrors = await validateURLs(filtered, 'cleaned');
+
+            console.log('\nValidating problematic redirects...\n');
+            const problematicErrors = await validateURLs(problematic, 'problematic');
+
+            errors = [...cleanedErrors, ...problematicErrors];
+
+            if (!errors.length) {
+                console.log('\nAll destinations returned 200.');
             }
+        }
 
-            const outputFilePath = path.join(outputDir, 'cleaned.csv');
-            const csvOutput = stringify(cleanedOutput, { header: false });
-            fs.writeFileSync(outputFilePath, csvOutput);
-            console.log(`✅ Cleaned CSV saved to: ${outputFilePath}`);
+        writeResults({ filtered, duplicateEntries, errors });
+    } finally {
+        rl.close();
+    }
+}
 
-            if (issues.length) {
-                console.log('\n--- Issues Found ---');
-                issues.forEach(i => console.log(i));
-            } else {
-                console.log('🎉 No issues found!');
-            }
-
-            rl.question('\nWould you like to validate final destination URLs? (y/n): ', async (answer) => {
-                if (answer.toLowerCase() !== 'y') {
-                    rl.close();
-                    return;
-                }
-
-                console.log('\n🌐 Validating URLs...');
-                const errorLog = [];
-
-                for (const row of cleanedOutput) {
-                    const sourceURL = Object.values(row)[0];
-                    const destURL = Object.values(row)[1];
-
-                    if (!destURL.startsWith('http')) {
-                        console.log(`⏩ Skipping invalid URL: ${destURL}`);
-                        errorLog.push({ source: sourceURL, destination: destURL, status: 'invalid url' });
-                        continue;
-                    }
-
-                    await sleep(1000);
-                    const result = await checkStatusCode(destURL);
-                    console.log(`🔗 ${result.url} → ${result.status}`);
-
-                    if (String(result.status) !== '200') {
-                        errorLog.push({ source: sourceURL, destination: destURL, status: result.status });
-                    }
-                }
-
-                if (errorLog.length) {
-                    const errorCsv = stringify(errorLog, { header: true });
-                    const errorPath = path.join(__dirname, 'output', 'redirect-errors.csv');
-                    fs.writeFileSync(errorPath, errorCsv);
-                    console.log(`\n❌ ${errorLog.length} errors written to: ${errorPath}`);
-                } else {
-                    console.log('\n✅ All destinations returned 200!');
-                }
-
-                rl.close();
-            });
-        });
-});
+main();
