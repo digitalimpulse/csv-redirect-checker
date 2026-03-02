@@ -115,6 +115,7 @@ function analyzeRedirects(rows) {
     }
 
     const filtered = [];
+    const problematic = [];
     const sourceSet = new Set();
     for (const entry of unique) {
         if (entry.normalizedSource === entry.normalizedDest) {
@@ -123,6 +124,7 @@ function analyzeRedirects(rows) {
                 source: entry.normalizedSource,
                 destination: entry.normalizedDest,
             });
+            problematic.push(entry);
         } else {
             filtered.push(entry);
             sourceSet.add(entry.normalizedSource);
@@ -136,11 +138,14 @@ function analyzeRedirects(rows) {
                 source: entry.normalizedSource,
                 destination: entry.normalizedDest,
             });
+            problematic.push(entry);
         }
     }
 
-    return { issues, filtered, duplicateEntries };
+    return { issues, filtered, problematic, duplicateEntries };
 }
+
+const urlCache = new Map();
 
 function checkStatusCode(url) {
     return new Promise((resolve) => {
@@ -161,23 +166,34 @@ function checkStatusCode(url) {
     });
 }
 
-async function validateURLs(rows) {
+async function checkStatusCodeCached(url) {
+    if (urlCache.has(url)) {
+        return { ...urlCache.get(url), cached: true };
+    }
+
+    await sleep(1000);
+    const result = await checkStatusCode(url);
+    urlCache.set(url, result);
+    return { ...result, cached: false };
+}
+
+async function validateURLs(rows, type) {
     const errors = [];
 
     for (const row of rows) {
         if (!row.destination.startsWith('http')) {
             console.log(`  [SKIP] ${row.destination} - not a valid URL`);
-            errors.push({ source: row.source, destination: row.destination, status: 'invalid url' });
+            errors.push({ source: row.source, destination: row.destination, status: 'invalid url', type });
             continue;
         }
 
-        await sleep(1000);
-        const result = await checkStatusCode(row.destination);
+        const result = await checkStatusCodeCached(row.destination);
         const label = String(result.status) === '200' ? 'OK' : 'FAIL';
-        console.log(`  [${label}] ${result.url} -> ${result.status}`);
+        const suffix = result.cached ? ' (cached)' : '';
+        console.log(`  [${label}] ${result.url} -> ${result.status}${suffix}`);
 
         if (String(result.status) !== '200') {
-            errors.push({ source: row.source, destination: row.destination, status: result.status });
+            errors.push({ source: row.source, destination: row.destination, status: result.status, type });
         }
     }
 
@@ -267,7 +283,7 @@ async function main() {
 
         console.log('Checking for redirect issues...\n');
         const rows = await parseCSV(fullPath);
-        const { issues, filtered, duplicateEntries } = analyzeRedirects(rows);
+        const { issues, filtered, problematic, duplicateEntries } = analyzeRedirects(rows);
 
         printSummary(issues);
 
@@ -275,8 +291,13 @@ async function main() {
         const answer = await prompt(rl, '\nWould you like to validate final destination URLs? (y/n): ');
 
         if (answer.toLowerCase() === 'y') {
-            console.log('\nValidating URLs...\n');
-            errors = await validateURLs(filtered);
+            console.log('\nValidating cleaned redirects...\n');
+            const cleanedErrors = await validateURLs(filtered, 'cleaned');
+
+            console.log('\nValidating problematic redirects...\n');
+            const problematicErrors = await validateURLs(problematic, 'problematic');
+
+            errors = [...cleanedErrors, ...problematicErrors];
 
             if (!errors.length) {
                 console.log('\nAll destinations returned 200.');
